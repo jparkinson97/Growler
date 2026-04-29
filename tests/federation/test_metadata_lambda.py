@@ -70,7 +70,7 @@ def test_get_table_returns_arrow_schema(handler, tmp_parquet_dir):
     resp = lam.handle(fx.get_table("default", "events"))
     assert resp["@type"] == "GetTableResponse"
     assert resp["partitionColumns"] == ["event_date", "region"]
-    schema = decode_schema(resp["schema"]["schema"])
+    schema = decode_schema(resp["schema"])
     assert "id" in schema.names
     assert schema.field("id").type == pa.int64()
 
@@ -109,9 +109,28 @@ def test_get_splits_from_layout(handler, tmp_parquet_dir):
     assert resp["@type"] == "GetSplitsResponse"
     assert len(resp["splits"]) == 3
     for s in resp["splits"]:
-        assert s["@type"] == "Split"
         assert "s3_uri" in s["properties"]
         assert s["properties"]["table"] == "default/events"
+
+
+def test_non_partitioned_table_gets_synthetic_partition(handler, tmp_parquet_dir):
+    from growler.federation.serde import partitions_from_block
+    from growler.federation.synthetic_partition import SYNTHETIC_COLUMN, SYNTHETIC_VALUE
+
+    handler.create_table(
+        "default/nopart",
+        [{"path": "id", "type": "int64", "nullable": False}],
+        partition_paths=[],
+    )
+    md = MetadataHandler(handler.store, catalog={"default": ["nopart"]})
+    lam = MetadataFederationLambda(md)
+
+    get_table = lam.handle(fx.get_table("default", "nopart"))
+    assert get_table["partitionColumns"] == [SYNTHETIC_COLUMN]
+
+    layout = lam.handle(fx.get_table_layout("default", "nopart"))
+    rows = partitions_from_block(layout["partitions"])
+    assert rows == [{SYNTHETIC_COLUMN: SYNTHETIC_VALUE}]
 
 
 def test_table_not_found(handler, tmp_parquet_dir):

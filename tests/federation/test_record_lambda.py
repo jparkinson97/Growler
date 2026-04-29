@@ -98,3 +98,42 @@ def test_unknown_request(handler, tmp_parquet_dir):
     rec_lam = RecordFederationLambda(RecordHandler(handler.store))
     resp = rec_lam.handle({"@type": "UnknownRequest"})
     assert resp["@type"] == "FederationException"
+
+
+def test_read_records_timestamp_cast_to_date64_preserves_ms(handler, tmp_parquet_dir):
+    handler.create_table(
+        "default/ts_table",
+        [
+            {"path": "id", "type": "int64", "nullable": False},
+            {"path": "ts", "type": "timestamp_us"},
+            {"path": "region", "type": "string", "nullable": False},
+        ],
+        partition_paths=["region"],
+    )
+    p = tmp_parquet_dir / "ts.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([1, 2], type=pa.int64()),
+                "ts": pa.array([1700000000123456, 1700000001234567], type=pa.timestamp("us")),
+                "region": ["us", "us"],
+            }
+        ),
+        p,
+    )
+    handler.add_files(
+        "default/ts_table",
+        [{"s3_uri": str(p), "partition_values": {"region": "us"}}],
+    )
+    md_lam = MetadataFederationLambda(MetadataHandler(handler.store, catalog={"default": ["ts_table"]}))
+    layout = md_lam.handle(fx.get_table_layout("default", "ts_table"))
+    splits_resp = md_lam.handle(fx.get_splits("default", "ts_table", layout["partitions"]))
+    split = splits_resp["splits"][0]
+    requested = pa.schema([pa.field("id", pa.int64()), pa.field("ts", pa.date64())])
+    event = fx.read_records("default", "ts_table", split, requested_schema_b64=encode_schema(requested))
+    resp = RecordFederationLambda(RecordHandler(handler.store)).handle(event)
+    schema, batch = decode_block(resp["records"])
+    assert schema.field("ts").type == pa.date64()
+    # Values must carry ms precision (not be truncated to midnight)
+    raw_ms = batch.column("ts").view(pa.int64()).to_pylist()
+    assert raw_ms == [1700000000123, 1700000001234]

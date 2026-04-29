@@ -28,9 +28,8 @@ def decode_batch(b64: str, schema: pa.Schema) -> pa.RecordBatch:
 
 def encode_block(schema: pa.Schema, batch: Optional[pa.RecordBatch]) -> dict:
     if batch is None:
-        batch = pa.record_batch({f.name: pa.array([], type=f.type) for f in schema}, schema=schema)
+        batch = pa.record_batch([pa.array([], type=f.type) for f in schema], schema=schema)
     return {
-        "@type": "Block",
         "aId": ALLOC_ID,
         "schema": encode_schema(schema),
         "records": encode_batch(batch),
@@ -53,8 +52,15 @@ def partitions_block_from_dicts(
     for row in row_list:
         for name, dtype in partition_columns:
             columns[name].append(_coerce(row.get(name), dtype))
-    arrays = [pa.array(columns[name], type=dtype) for name, dtype in partition_columns]
-    batch = pa.record_batch(arrays, schema=schema) if row_list else None
+    if not partition_columns:
+        if row_list:
+            placeholder = pa.table({"_": pa.array([None] * len(row_list), type=pa.null())})
+            batch = placeholder.drop(["_"]).to_batches()[0]
+        else:
+            batch = None
+    else:
+        arrays = [pa.array(columns[name], type=dtype) for name, dtype in partition_columns]
+        batch = pa.record_batch(arrays, schema=schema) if row_list else None
     return encode_block(schema, batch)
 
 

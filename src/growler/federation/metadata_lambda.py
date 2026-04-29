@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import json
 from typing import Any, Optional
+import uuid
 
 import pyarrow as pa
 
 from growler.errors import GrowlerError, TableNotFound
 from growler.federation.constraints import ConstraintsEvaluator, parse_constraints
 from growler.federation.serde import encode_schema, partitions_block_from_dicts
+from growler.federation.synthetic_partition import (
+    SYNTHETIC_COLUMN,
+    SYNTHETIC_TYPE,
+    SYNTHETIC_VALUE,
+    augment_schema,
+    needed,
+)
 from growler.federation.wire import (
     error_envelope,
     make_split,
@@ -59,41 +67,46 @@ class MetadataFederationLambda:
     def _ping(self, event: dict) -> dict:
         return ok_envelope(
             "PingResponse",
-            catalog_name=event.get("catalogName", self.catalog_name),
+            catalogName=event.get("catalogName", self.catalog_name),
+            queryId=event.get("queryId", ""),
             sourceType=self.source_type,
             capabilities=0,
             serDeVersion=2,
-            queryId=event.get("queryId", ""),
         )
 
     def _list_schemas(self, event: dict) -> dict:
         return ok_envelope(
             "ListSchemasResponse",
-            catalog_name=event.get("catalogName", self.catalog_name),
+            catalogName=event.get("catalogName", self.catalog_name),
             schemas=self.metadata.do_list_schema_names(),
         )
 
     def _list_tables(self, event: dict) -> dict:
         schema = event.get("schemaName") or event.get("schema") or ""
         tables = [
-            {"@type": "TableName", "schemaName": schema, "tableName": t}
+            {"schemaName": schema, "tableName": t}
             for t in self.metadata.do_list_tables(schema)
         ]
         return ok_envelope(
             "ListTablesResponse",
-            catalog_name=event.get("catalogName", self.catalog_name),
             tables=tables,
+            catalogName=event.get("catalogName", self.catalog_name),
         )
 
     def _get_table(self, event: dict) -> dict:
         schema_name, table = table_name(event.get("tableName") or {})
         info = self.metadata.do_get_table(schema_name, table)
+        arrow_schema = info["arrow_schema"]
+        partition_columns = info["partition_columns"]
+        if needed(partition_columns):
+            arrow_schema = augment_schema(arrow_schema)
+            partition_columns = [SYNTHETIC_COLUMN]
         return ok_envelope(
             "GetTableResponse",
-            catalog_name=event.get("catalogName", self.catalog_name),
-            tableName={"@type": "TableName", "schemaName": schema_name, "tableName": table},
-            schema={"@type": "Schema", "schema": encode_schema(info["arrow_schema"])},
-            partitionColumns=info["partition_columns"],
+            catalogName=event.get("catalogName", self.catalog_name),
+            tableName={"schemaName": schema_name, "tableName": table},
+            schema=encode_schema(arrow_schema),
+            partitionColumns=partition_columns,
         )
 
     def _get_table_layout(self, event: dict) -> dict:
@@ -105,13 +118,18 @@ class MetadataFederationLambda:
         parts = self.metadata.get_partitions(schema_name, table, predicate)
         info = self.metadata.do_get_table(schema_name, table)
         partition_columns = info["partition_columns"]
-        partition_types = _partition_types(info["arrow_schema"], partition_columns)
-        rows = [p["partition_values"] for p in parts]
+        if needed(partition_columns):
+            partition_columns = [SYNTHETIC_COLUMN]
+            partition_types = [SYNTHETIC_TYPE]
+            rows = [{SYNTHETIC_COLUMN: SYNTHETIC_VALUE}]
+        else:
+            partition_types = _partition_types(info["arrow_schema"], partition_columns)
+            rows = [p["partition_values"] for p in parts]
         block = partitions_block_from_dicts(list(zip(partition_columns, partition_types)), rows)
         return ok_envelope(
             "GetTableLayoutResponse",
-            catalog_name=event.get("catalogName", self.catalog_name),
-            tableName={"@type": "TableName", "schemaName": schema_name, "tableName": table},
+            catalogName=event.get("catalogName", self.catalog_name),
+            tableName={"schemaName": schema_name, "tableName": table},
             partitions=block,
         )
 
@@ -119,44 +137,78 @@ class MetadataFederationLambda:
         schema_name, table = table_name(event.get("tableName") or {})
         partitions_block = event.get("partitions") or None
         continuation_token = event.get("continuationToken")
+        
+        # 1. Grab the queryId from the event (used to organize spill files)
+        query_id = event.get("queryId", "unknown-query")
+        
+        # 2. Get spill bucket and prefix (usually passed as Lambda Environment Variables)
+        spill_bucket = "asf-custom-data-source"
+        spill_prefix = "spill"
+
         from growler.federation.serde import partitions_from_block
 
-        if partitions_block:
+        info = self.metadata.do_get_table(schema_name, table)
+        synthetic = needed(info["partition_columns"])
+
+        if partitions_block and not synthetic:
             partition_rows = partitions_from_block(partitions_block)
             eligible = set(_tuple_key(r) for r in partition_rows)
         else:
             eligible = None
+            
         splits = self.metadata.do_get_splits(schema_name, table)
         if eligible is not None:
             splits = [s for s in splits if _tuple_key(s.get("partition_values", {})) in eligible]
+            
         start = int(continuation_token) if continuation_token else 0
         page_size = 1000
         page = splits[start : start + page_size]
         next_token = str(start + page_size) if start + page_size < len(splits) else None
-        split_objs = [
-            make_split(
-                properties={
-                    "s3_uri": s["s3_uri"],
-                    "table": s["table"],
-                    "column_mapping": json.dumps(s.get("column_mapping", {})),
-                    "partition_values": json.dumps(s.get("partition_values", {})),
-                    "row_count": str(s.get("row_count", 0)),
-                }
+        
+        # 3. Add the spill_location dict to make_split
+        split_objs = []
+        for s in page:
+            split_id = str(uuid.uuid4())
+            
+            spill_location = {
+                "@type": "S3SpillLocation",
+                "bucket": spill_bucket,
+                "key": f"{spill_prefix}/{query_id}/{split_id}",
+                "directory": True
+            }
+            
+            split_objs.append(
+                make_split(
+                    properties={
+                        "s3_uri": s["s3_uri"],
+                        "table": s["table"],
+                        "column_mapping": json.dumps(s.get("column_mapping", {})),
+                        "partition_values": json.dumps(
+                            _augment_partition_values(s.get("partition_values", {}), synthetic)
+                        ),
+                        "row_count": str(s.get("row_count", 0)),
+                    },
+                    spill_location=spill_location
+                )
             )
-            for s in page
-        ]
-        resp = ok_envelope(
-            "GetSplitsResponse",
-            catalog_name=event.get("catalogName", self.catalog_name),
-            splits=split_objs,
-        )
-        if next_token is not None:
-            resp["continuationToken"] = next_token
-        return resp
 
+        return ok_envelope(
+            "GetSplitsResponse",
+            catalogName=event.get("catalogName", self.catalog_name),
+            splits=split_objs,
+            continuationToken=next_token,
+        )
 
 def _tuple_key(pvals: dict[str, str]) -> tuple:
     return tuple(sorted((k, str(v)) for k, v in pvals.items()))
+
+
+def _augment_partition_values(pvals: dict, synthetic: bool) -> dict:
+    if not synthetic:
+        return pvals
+    out = dict(pvals)
+    out[SYNTHETIC_COLUMN] = SYNTHETIC_VALUE
+    return out
 
 
 def _partition_types(arrow_schema: pa.Schema, partition_columns: list[str]) -> list[pa.DataType]:
