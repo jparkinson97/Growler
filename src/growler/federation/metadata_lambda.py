@@ -138,12 +138,10 @@ class MetadataFederationLambda:
         partitions_block = event.get("partitions") or None
         continuation_token = event.get("continuationToken")
         
-        # 1. Grab the queryId from the event (used to organize spill files)
         query_id = event.get("queryId", "unknown-query")
         
-        # 2. Get spill bucket and prefix (usually passed as Lambda Environment Variables)
         spill_bucket = "asf-custom-data-source"
-        spill_prefix = "spill"
+        spill_prefix = f"spill/{table}"
 
         from growler.federation.serde import partitions_from_block
 
