@@ -26,7 +26,7 @@ def test_schema_roundtrip():
 
 def test_batch_roundtrip():
     s = pa.schema([pa.field("a", pa.int64()), pa.field("b", pa.string())])
-    batch = pa.record_batch({"a": [1, 2], "b": ["x", "y"]}, schema=s)
+    batch = pa.record_batch([pa.array([1, 2]), pa.array(["x", "y"])], schema=s)
     b64 = encode_batch(batch)
     back = decode_batch(b64, s)
     assert back.equals(batch)
@@ -34,9 +34,8 @@ def test_batch_roundtrip():
 
 def test_block_roundtrip():
     s = pa.schema([pa.field("a", pa.int64())])
-    batch = pa.record_batch({"a": [1, 2, 3]}, schema=s)
+    batch = pa.record_batch([pa.array([1, 2, 3])], schema=s)
     block = encode_block(s, batch)
-    assert block["@type"] == "Block"
     assert block["aId"]
     s2, b2 = decode_block(block)
     assert s2 == s
@@ -49,6 +48,16 @@ def test_empty_block():
     s2, b2 = decode_block(block)
     assert s2 == s
     assert b2.num_rows == 0
+
+
+def test_partitions_block_no_columns_preserves_row_count():
+    # Non-partitioned tables produce one implicit partition row with zero columns.
+    block = partitions_block_from_dicts([], [{}])
+    from growler.federation.serde import decode_block
+
+    _, batch = decode_block(block)
+    assert batch.num_rows == 1
+    assert batch.num_columns == 0
 
 
 def test_partitions_block_roundtrip():

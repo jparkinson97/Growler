@@ -26,6 +26,8 @@ def build_arrow_schema(schema: Schema) -> pa.Schema:
 
 
 def _emit_field(name: str, entry: dict) -> pa.Field:
+    from growler.types import _parse_map
+
     col: Column | None = entry["column"]
     children = entry["children"]
     if col is None:
@@ -38,6 +40,11 @@ def _emit_field(name: str, entry: dict) -> pa.Field:
     if t == "list<struct>":
         inner = [_emit_field(n, e) for n, e in children.items()]
         return pa.field(name, pa.list_(pa.struct(inner)), nullable=col.nullable)
+    map_parsed = _parse_map(t)
+    if map_parsed and map_parsed[1] == "struct":
+        k_type = to_arrow(map_parsed[0])
+        inner = [_emit_field(n, e) for n, e in children.items()]
+        return pa.field(name, pa.map_(k_type, pa.struct(inner)), nullable=col.nullable)
     return pa.field(name, to_arrow(t), nullable=col.nullable)
 
 

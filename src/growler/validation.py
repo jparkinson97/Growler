@@ -32,6 +32,13 @@ def _walk_field(field: pa.Field, prefix: str, out: dict[str, pa.DataType]) -> No
             for i in range(inner.num_fields):
                 _walk_field(inner.field(i), path, out)
         return
+    if pa.types.is_map(t):
+        out[path] = t
+        inner = t.item_type
+        if pa.types.is_struct(inner):
+            for i in range(inner.num_fields):
+                _walk_field(inner.field(i), path, out)
+        return
     out[path] = t
 
 
@@ -92,7 +99,12 @@ def extract_stats(pq_file: pq.ParquetFile, column_mapping: dict[int, str]) -> di
         if path not in top_leaf_paths:
             continue
         t = top_leaf_paths[path]
-        if pa.types.is_struct(t) or pa.types.is_list(t) or pa.types.is_large_list(t):
+        if (
+            pa.types.is_struct(t)
+            or pa.types.is_list(t)
+            or pa.types.is_large_list(t)
+            or pa.types.is_map(t)
+        ):
             continue
         agg_min = None
         agg_max = None
